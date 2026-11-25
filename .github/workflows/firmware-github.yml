@@ -1,0 +1,466 @@
+name: Firmware (GitHub-only)
+
+# Fork-friendly build: no S3, no Release environment and no required secrets.
+# It uses only GitHub services, so it runs in any fork once Actions is enabled:
+#   - BitBake image hand-off: workflow artifact             (upstream: S3)
+#   - Docker layer cache:     BuildKit "gha" cache          (upstream: S3)
+#   - DL_DIR / SSTATE_DIR:    actions/cache, bind-mounted   (upstream: S3 + hashserv)
+#   - Tags and release:       GITHUB_TOKEN, in this repository
+# The upstream repository keeps using firmware.yml; this file is skipped there.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      machine-x1600-aic8800d80:
+        description: Build x1600-aic8800d80 and recovery
+        type: boolean
+        default: false
+      machine-v821b-rtl8733bs:
+        description: Build v821b-rtl8733bs and recovery
+        type: boolean
+        default: true
+      machine-v851s3-aic8800d80:
+        description: Build v851s3-aic8800d80 and recovery
+        type: boolean
+        default: true
+      machine-v553-aic8800d80:
+        description: Build v553-aic8800d80 and recovery
+        type: boolean
+        default: true
+      github-release-prerelease:
+        description: GitHub release is prerelease
+        type: boolean
+        default: false
+      release-tag-prerelease:
+        description: Release tag is prerelease (-preN suffix)
+        type: boolean
+        default: false
+      catplay-ref:
+        description: CatPlay source branch, tag or commit
+        required: true
+        default: master
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: firmware-github
+  cancel-in-progress: false
+
+env:
+  # Repository variables are optional; forks don't inherit them, so defaults must work.
+  CATPLAY_REPOSITORY: ${{ vars.CATPLAY_REPOSITORY || 'catplay-labs/catplay' }}
+
+jobs:
+  source:
+    name: Prepare sources and release metadata
+    if: ${{ github.repository != 'catplay-labs/catplay-firmware' }}
+    runs-on: ubuntu-24.04
+    env:
+      GITHUB_RELEASE_PRERELEASE: ${{ inputs.github-release-prerelease || false }}
+      TAG_PRERELEASE: ${{ inputs.release-tag-prerelease || false }}
+      CATPLAY_REF: ${{ inputs.catplay-ref || 'master' }}
+      # Optional: only needed if CATPLAY_REPOSITORY points at a private repository.
+      CATPLAY_ACCESS_TOKEN: ${{ secrets.CATPLAY_ACCESS_TOKEN }}
+    outputs:
+      machines: ${{ steps.matrix.outputs.machines }}
+      max-parallel-builds: ${{ steps.build-limit.outputs.parallelism }}
+    steps:
+      - name: Configure build parallelism
+        id: build-limit
+        env:
+          FIRMWARE_MAX_PARALLEL_BUILDS: ${{ vars.FIRMWARE_MAX_PARALLEL_BUILDS }}
+        run: |
+          limit=${FIRMWARE_MAX_PARALLEL_BUILDS:-10}
+          if [[ ! "$limit" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::FIRMWARE_MAX_PARALLEL_BUILDS must be a positive integer'
+            exit 1
+          fi
+          printf 'parallelism=%s\n' "$limit" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare machine matrix
+        id: matrix
+        env:
+          MACHINE_SELECTION: >-
+            {
+              "x1600-aic8800d80": ${{ github.event_name != 'workflow_dispatch' || inputs.machine-x1600-aic8800d80 }},
+              "v821b-rtl8733bs": ${{ github.event_name != 'workflow_dispatch' || inputs.machine-v821b-rtl8733bs }},
+              "v851s3-aic8800d80": ${{ github.event_name != 'workflow_dispatch' || inputs.machine-v851s3-aic8800d80 }},
+              "v553-aic8800d80": ${{ github.event_name != 'workflow_dispatch' || inputs.machine-v553-aic8800d80 }}
+            }
+        run: |
+          machines=$(jq -ce '
+            [to_entries[] | select(.value == true) | .key]
+            | sort
+            | map([. + "-recov", .]) | add // []
+            | if length > 0 then . else error("Select at least one firmware machine") end
+          ' <<< "$MACHINE_SELECTION")
+          printf 'machines=%s\n' "$machines" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare pinned checkouts, version and release notes
+        shell: bash
+        run: |
+          value="${CATPLAY_REPOSITORY#https://github.com/}"
+          value="${value%/}"; value="${value%.git}"
+          if [[ ! "$value" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo '::error::CATPLAY_REPOSITORY must be a GitHub OWNER/REPO'
+            exit 1
+          fi
+          CATPLAY_REPOSITORY=$value
+          for name in TAG_PRERELEASE GITHUB_RELEASE_PRERELEASE; do
+            value="${!name}"
+            case "${value,,}" in
+              true|false) printf -v "$name" '%s' "${value,,}" ;;
+              *) echo "::error::$name must be true or false"; exit 1 ;;
+            esac
+          done
+          umask 077
+          credentials=$(mktemp -d)
+          trap 'rm -rf "$credentials"' EXIT
+          token_args=()
+          if [[ -n "$CATPLAY_ACCESS_TOKEN" ]]; then
+            printf '%s' "$CATPLAY_ACCESS_TOKEN" > "$credentials/catplay-token"
+            token_args+=(--catplay-token-file "$credentials/catplay-token")
+          fi
+          tag_args=()
+          if [[ "$TAG_PRERELEASE" == true ]]; then
+            tag_args+=(--tag-prerelease)
+          fi
+          metadata="$RUNNER_TEMP/release-metadata"
+          mkdir -p "$metadata"
+          python3 .ci/nightly.py checkout \
+            --catplay-repo "$CATPLAY_REPOSITORY" \
+            --catplay-revision "$CATPLAY_REF" \
+            --catplay-branch "$CATPLAY_REF" \
+            --catplay-checkout "$GITHUB_WORKSPACE/catplay-source" \
+            --firmware-repo "$GITHUB_REPOSITORY" \
+            --firmware-revision "$GITHUB_SHA" \
+            --firmware-branch "$GITHUB_REF_NAME" \
+            --firmware-checkout "$GITHUB_WORKSPACE" \
+            --firmware-use-existing-checkout \
+            --release-notes "$metadata/release-notes.md" \
+            --tag-file "$metadata/release_tag.txt" \
+            "${token_args[@]}" "${tag_args[@]}"
+          catplay_sha=$(git -C "$GITHUB_WORKSPACE/catplay-source" rev-parse HEAD)
+          firmware_sha=$(git rev-parse HEAD)
+          [[ "$firmware_sha" == "$GITHUB_SHA" ]]
+          jq -n \
+            --arg tag "$(cat "$metadata/release_tag.txt")" \
+            --arg catplay_repo "$CATPLAY_REPOSITORY" --arg catplay_sha "$catplay_sha" \
+            --arg firmware_repo "$GITHUB_REPOSITORY" --arg firmware_sha "$firmware_sha" \
+            --argjson tag_prerelease "$TAG_PRERELEASE" \
+            --argjson github_release_prerelease "$GITHUB_RELEASE_PRERELEASE" \
+            '{tag: $tag, tag_prerelease: $tag_prerelease,
+              github_release_prerelease: $github_release_prerelease,
+              catplay: {repository: $catplay_repo, revision: $catplay_sha},
+              firmware: {repository: $firmware_repo, revision: $firmware_sha}}' \
+            > "$metadata/revisions.json"
+
+      - name: Create source bundles once for all machines
+        run: bash meta-catplay/scripts/create-src-bundle.sh "$GITHUB_WORKSPACE/catplay-source"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: catplay-source
+          path: |
+            meta-catplay/recipes-apps/files/catplay.tar.gz
+            meta-catplay/recipes-apps/files/catplay-g-iphone.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/release-metadata/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: Build shared BitBake image
+    if: ${{ github.repository != 'catplay-labs/catplay-firmware' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check out BitBake image sources
+        run: git submodule update --init bitbake
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: .ci/Dockerfile
+          tags: catplay-bitbake:ci
+          outputs: type=docker,dest=${{ runner.temp }}/bitbake-image.tar
+          cache-from: type=gha,scope=bitbake-image
+          cache-to: type=gha,mode=max,scope=bitbake-image
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bitbake-image
+          path: ${{ runner.temp }}/bitbake-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+  build:
+    name: Build ${{ matrix.machine }}
+    needs: [source, image]
+    runs-on: ${{ vars.FIRMWARE_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 350   # GitHub-hosted jobs are capped at 360
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJSON(needs.source.outputs.max-parallel-builds) }}
+      matrix:
+        machine: ${{ fromJSON(needs.source.outputs.machines) }}
+    env:
+      NO_COLOR: '1'
+      MACHINE: ${{ matrix.machine }}
+      YOCTO_CACHE: /mnt/yocto-cache
+      # Optional public HTTP(S) mirror holding sstate-cache/ and downloads/ (read-only).
+      FIRMWARE_STATE_MIRROR: ${{ vars.FIRMWARE_STATE_MIRROR }}
+    steps:
+      - name: Initial disk usage
+        run: df -h
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Free disk space on hosted runner
+        if: ${{ runner.environment == 'github-hosted' }}
+        uses: ./.github/actions/cleanup
+        with:
+          remove-browsers: true
+
+      # The root disk of a hosted runner is too small for a Yocto build; /mnt is larger.
+      # Docker's data root (the /cache build volume, i.e. TMPDIR) and the caches go there.
+      - name: Move Docker storage and build caches to /mnt
+        if: ${{ runner.environment == 'github-hosted' }}
+        run: |
+          sudo systemctl stop docker.socket docker
+          sudo mkdir -p /mnt/docker
+          current=$(sudo cat /etc/docker/daemon.json 2>/dev/null || echo '{}')
+          jq '. + {"data-root": "/mnt/docker"}' <<< "$current" | sudo tee /etc/docker/daemon.json
+          sudo systemctl start docker
+          df -h / /mnt
+
+      - name: Prepare cache directory
+        run: |
+          sudo mkdir -p "$YOCTO_CACHE"
+          sudo chown "$(id -u):$(id -g)" "$YOCTO_CACHE"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: catplay-source
+          path: meta-catplay/recipes-apps/files
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: bitbake-image
+          path: ${{ runner.temp }}/bitbake-image
+
+      - name: Load shared BitBake image
+        run: |
+          docker load -i "$RUNNER_TEMP/bitbake-image/bitbake-image.tar"
+          rm -rf "$RUNNER_TEMP/bitbake-image"
+
+      # One sstate cache per matrix entry; a single shared downloads cache.
+      - name: Restore sstate cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: yocto-sstate-${{ matrix.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: yocto-sstate-${{ matrix.machine }}-
+
+      - name: Restore downloads cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.YOCTO_CACHE }}/downloads
+          key: yocto-downloads-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: yocto-downloads-
+
+      - name: Build firmware
+        run: |
+          mirror_args=()
+          if [[ -n "$FIRMWARE_STATE_MIRROR" ]]; then
+            mirror_args+=(--state-s3 "$FIRMWARE_STATE_MIRROR")
+          fi
+          python3 .ci/disk_usage.py run --output "$RUNNER_TEMP/disk-metrics" -- \
+            python3 .ci/build-fw.py \
+            --firmware-dir "$GITHUB_WORKSPACE" \
+            --alias "ci-$MACHINE" \
+            --cached-image catplay-bitbake:ci \
+            --machine "$MACHINE" \
+            --downloads-dir "$YOCTO_CACHE/downloads" \
+            --sstate-dir "$YOCTO_CACHE/sstate-cache" \
+            --no-keep-container \
+            --artifacts-output "$RUNNER_TEMP/firmware-artifacts" \
+            "${mirror_args[@]}"
+
+      - name: Capture final cache sizes
+        if: ${{ always() }}
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          python3 .ci/disk_usage.py report --output "$RUNNER_TEMP/disk-metrics" \
+            --container "catplay-bitbake-ci-$MACHINE-run"
+
+      # Saved even when the build fails: sstate from a partial build is still valid.
+      - name: Save sstate cache
+        if: ${{ always() && !cancelled() }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.YOCTO_CACHE }}/sstate-cache
+          key: yocto-sstate-${{ matrix.machine }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Parallel jobs share this key; the first to finish saves it, others log a warning.
+      - name: Save downloads cache
+        if: ${{ always() && !cancelled() }}
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.YOCTO_CACHE }}/downloads
+          key: yocto-downloads-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: disk-${{ matrix.machine }}
+          path: ${{ runner.temp }}/disk-metrics/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Preserve artifact permissions and symlinks
+        run: tar -C "$RUNNER_TEMP/firmware-artifacts" -cf "$RUNNER_TEMP/$MACHINE.tar" tmp-c2a
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-${{ matrix.machine }}
+          path: ${{ runner.temp }}/${{ matrix.machine }}.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  pack:
+    name: Pack and publish firmware release
+    needs: [source, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write   # GITHUB_TOKEN pushes the tag and creates the release
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: firmware-*
+          path: ${{ runner.temp }}/firmware-parts
+          merge-multiple: true
+
+      - name: Join recovery and regular variants
+        shell: bash
+        env:
+          MACHINES_JSON: ${{ needs.source.outputs.machines }}
+        run: |
+          mkdir -p artifacts
+          # Recovery contributes tools and images, then the regular machine
+          # overlays shared files in the same bundle.
+          while IFS= read -r machine; do
+            tar -C artifacts -xf "$RUNNER_TEMP/firmware-parts/$machine.tar"
+          done < <(jq -r '.[]' <<< "$MACHINES_JSON")
+
+      - name: Install archive tool
+        run: sudo apt-get update && sudo apt-get install -y 7zip
+
+      - name: Pack local artifacts without Docker or BitBake
+        run: python3 .ci/build-fw.py --pack-artifacts --artifacts-output artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: c2a-bundles
+          path: artifacts/c2a/
+          if-no-files-found: error
+          compression-level: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-metadata
+          path: ${{ runner.temp }}/release-metadata
+
+      - name: Push firmware tag and publish GitHub release
+        shell: bash
+        env:
+          REPOSITORY_TOKEN: ${{ github.token }}
+        run: |
+          metadata="$RUNNER_TEMP/release-metadata"
+          tag=$(jq -er '.tag' "$metadata/revisions.json")
+          [[ "$tag" == "$(cat "$metadata/release_tag.txt")" ]]
+          catplay_repo=$(jq -er '.catplay.repository' "$metadata/revisions.json")
+          firmware_sha=$(jq -er '.firmware.revision' "$metadata/revisions.json")
+          umask 077
+          credentials=$(mktemp -d)
+          trap 'rm -rf "$credentials"' EXIT
+          printf '%s' "$REPOSITORY_TOKEN" > "$credentials/token"
+          # GITHUB_TOKEN can only write to this repository, so CatPlay is not tagged.
+          python3 .ci/nightly.py push-tags \
+            --catplay-repo "$catplay_repo" --skip-catplay-tag \
+            --firmware-repo "$GITHUB_REPOSITORY" --firmware-revision "$firmware_sha" \
+            --firmware-checkout "$GITHUB_WORKSPACE" \
+            --firmware-token-file "$credentials/token" \
+            --tag "$tag" \
+            --tagger-name 'github-actions[bot]' \
+            --tagger-email '41898282+github-actions[bot]@users.noreply.github.com'
+          release_args=(--target-commitish "$firmware_sha")
+          if jq -e '.github_release_prerelease == true' "$metadata/revisions.json" > /dev/null; then
+            release_args+=(--prerelease)
+          fi
+          python3 .ci/github_release.py \
+            --repo "$GITHUB_REPOSITORY" --tag "$tag" \
+            --release-notes "$metadata/release-notes.md" \
+            --artifacts-dir "$GITHUB_WORKSPACE/artifacts/c2a" \
+            --token-file "$credentials/token" \
+            "${release_args[@]}"
+
+  cleanup:
+    name: Remove intermediate workflow artifacts
+    needs: [source, image, build, pack]
+    if: ${{ always() && github.repository != 'catplay-labs/catplay-firmware' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Delete all artifacts except final bundles
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # List every page before deleting, so pagination cannot skip entries.
+          gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(
+              .name != "c2a-bundles"
+              # Uncomment to retain disk metrics:
+              # and (.name | startswith("disk-") | not)
+            ) | [.id, .name] | @tsv' > "$RUNNER_TEMP/artifacts-to-delete.tsv"
+          status=0
+          while IFS=$'\t' read -r artifact_id artifact_name; do
+            echo "Deleting artifact: $artifact_name ($artifact_id)"
+            if ! gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact_id"; then
+              status=1
+            fi
+          done < "$RUNNER_TEMP/artifacts-to-delete.tsv"
+          exit "$status"
