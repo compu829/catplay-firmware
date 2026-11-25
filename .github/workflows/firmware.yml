@@ -46,6 +46,8 @@ concurrency:
 jobs:
   source:
     name: Prepare sources and release metadata
+    # Forks have no S3 bucket or Release environment; they use firmware-github.yml.
+    if: ${{ github.repository == 'catplay-labs/catplay-firmware' }}
     runs-on: ubuntu-24.04
     environment: Release
     env:
@@ -188,6 +190,7 @@ jobs:
 
   image:
     name: Build shared BitBake image
+    if: ${{ github.repository == 'catplay-labs/catplay-firmware' }}
     runs-on: ubuntu-24.04
     environment: Release
     outputs:
@@ -508,7 +511,7 @@ jobs:
   cleanup:
     name: Remove intermediate workflow artifacts
     needs: [source, image, hashserv-merge, build, pack]
-    if: ${{ always() }}
+    if: ${{ always() && github.repository == 'catplay-labs/catplay-firmware' }}
     runs-on: ubuntu-24.04
     environment: Release
     permissions:
