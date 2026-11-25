@@ -62,6 +62,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         metavar="IMAGE",
         help="skip docker build, optionally selecting an image name",
     )
+    parser.add_argument(
+        "--downloads-dir", type=Path, metavar="DIR",
+        help="bind-mount this host directory as DL_DIR instead of a Docker volume",
+    )
+    parser.add_argument(
+        "--sstate-dir", type=Path, metavar="DIR",
+        help="bind-mount this host directory as SSTATE_DIR instead of a Docker volume",
+    )
     parser.add_argument("--reset-tmp", action="store_true")
     parser.add_argument(
         "--fresh-c2a-bundle",
@@ -256,12 +264,34 @@ def artifact_patterns(values: Sequence[str] | None) -> list[str]:
     return patterns
 
 
+def host_cache_dir(path: Path, description: str) -> Path:
+    """Create (if needed) and resolve a host directory used as a build cache."""
+    resolved = path.expanduser()
+    resolved.mkdir(parents=True, exist_ok=True)
+    resolved = resolved.resolve()
+    if not resolved.is_dir():
+        raise ValueError(f"{description} is not a directory: {resolved}")
+    return resolved
+
+
+def cache_mount_args(cache_mounts, *, readonly: bool = False) -> list[str]:
+    """Render (type, source, destination) cache mounts as docker --mount options."""
+    arguments = []
+    for kind, source, destination in cache_mounts:
+        option = f"type={kind},src={source},dst={destination}"
+        if readonly:
+            option += ",readonly"
+        if kind == "volume":
+            option += ",volume-nocopy"
+        arguments.extend(["--mount", option])
+    return arguments
+
+
 def export_artifacts(
     *,
     image: str,
     volume: str,
-    downloads_volume: str,
-    sstate_volume: str,
+    cache_mounts,
     orchestrator_dir: Path,
     output: Path,
     patterns: Sequence[str],
@@ -280,10 +310,7 @@ def export_artifacts(
         f"{os.getuid()}:{os.getgid()}",
         "--volume",
         f"{volume}:/cache:ro",
-        "--mount",
-        f"type=volume,src={downloads_volume},dst=/cache/build/downloads,readonly,volume-nocopy",
-        "--mount",
-        f"type=volume,src={sstate_volume},dst=/cache/build/sstate-cache,readonly,volume-nocopy",
+        *cache_mount_args(cache_mounts, readonly=True),
         "--volume",
         f"{orchestrator_dir}:/orchestrator:ro",
         "--volume",
@@ -449,7 +476,18 @@ def execute_locked(args: argparse.Namespace) -> int:
             ]
         )
 
-    for name in (volume, downloads_volume, sstate_volume):
+    # Host directories (e.g. restored by actions/cache) replace the named volumes.
+    cache_mounts = []
+    for host_dir, named_volume, destination, description in (
+        (args.downloads_dir, downloads_volume, "/cache/build/downloads", "downloads directory"),
+        (args.sstate_dir, sstate_volume, "/cache/build/sstate-cache", "sstate directory"),
+    ):
+        if host_dir is not None:
+            cache_mounts.append(("bind", str(host_cache_dir(host_dir, description)), destination))
+        else:
+            cache_mounts.append(("volume", named_volume, destination))
+
+    for name in [volume, *(source for kind, source, _ in cache_mounts if kind == "volume")]:
         run(["docker", "volume", "create", name])
 
     main_args = [
@@ -485,8 +523,7 @@ def execute_locked(args: argparse.Namespace) -> int:
         "--entrypoint", "/orchestrator/container-entrypoint.sh",
         "--volume", f"{firmware_dir}:/workdir",
         "--volume", f"{volume}:/cache",
-        "--mount", f"type=volume,src={downloads_volume},dst=/cache/build/downloads,volume-nocopy",
-        "--mount", f"type=volume,src={sstate_volume},dst=/cache/build/sstate-cache,volume-nocopy",
+        *cache_mount_args(cache_mounts),
         "--volume", f"{orchestrator_dir}:/orchestrator:ro",
         "--volume", f"{config_dir}:/config:ro",
         "--env", "HOME=/cache/home",
@@ -499,8 +536,7 @@ def execute_locked(args: argparse.Namespace) -> int:
     mounts = {
         "/workdir": ("bind", str(firmware_dir), True),
         "/cache": ("volume", volume, True),
-        "/cache/build/downloads": ("volume", downloads_volume, True),
-        "/cache/build/sstate-cache": ("volume", sstate_volume, True),
+        **{destination: (kind, source, True) for kind, source, destination in cache_mounts},
         "/orchestrator": ("bind", str(orchestrator_dir), False),
         "/config": ("bind", str(config_dir), False),
     }
@@ -562,8 +598,7 @@ def execute_locked(args: argparse.Namespace) -> int:
             export_artifacts(
                 image=image_id,
                 volume=volume,
-                downloads_volume=downloads_volume,
-                sstate_volume=sstate_volume,
+                cache_mounts=cache_mounts,
                 orchestrator_dir=orchestrator_dir,
                 output=args.artifacts_output,
                 patterns=artifact_patterns(args.artifacts_pattern),
