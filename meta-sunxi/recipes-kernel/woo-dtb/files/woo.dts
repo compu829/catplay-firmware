@@ -159,7 +159,8 @@
 	status = "okay";
 
 	bluetooth {
-		compatible = "realtek,rtl8733bs-bt";
+		// compatible = "realtek,rtl8733bs-bt";
+		compatible = "aic,aic-bt";
 	};
 };
 
